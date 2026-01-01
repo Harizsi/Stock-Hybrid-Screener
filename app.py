@@ -2,396 +2,271 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-
-
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, roc_auc_score
+import warnings
+warnings.filterwarnings("ignore")
 
-
-# Create two tabs
-tab1, tab2 = st.tabs(["Single Stock Analysis", "Multi-Stock Analysis"])
+st.set_page_config(page_title="Enhanced Stock Predictor", layout="wide")
 
 # =========================
-# Indicator Functions
+# Technical Indicators
 # =========================
 
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
+def sma(series, period):
+    return series.rolling(period).mean()
 
 def rsi(series, period=14):
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
-
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+def macd(series, fast=12, slow=26, signal=9):
+    fast_ema = ema(series, fast)
+    slow_ema = ema(series, slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def bollinger_bands(series, period=20, std_dev=2):
+    mid = sma(series, period)
+    std = series.rolling(period).std()
+    return mid + std * std_dev, mid, mid - std * std_dev
+
+def atr(df, period=14):
+    hl = df["High"] - df["Low"]
+    hc = np.abs(df["High"] - df["Close"].shift())
+    lc = np.abs(df["Low"] - df["Close"].shift())
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+def obv(df):
+    return (np.sign(df["Close"].diff()) * df["Volume"]).fillna(0).cumsum()
 
 # =========================
-# Layer 1: Rules
+# Feature Engineering
 # =========================
 
-def layer1_signals(df):
-    signals = {}
+def add_features(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
 
-    signals["trend"] = int(df["EMA20"].iloc[-1] > df["EMA50"].iloc[-1])
-    signals["momentum"] = int(40 <= df["RSI"].iloc[-1] <= 70)
-    signals["volume"] = int(df["Volume"].iloc[-1] > df["Volume_MA"].iloc[-1])
+    df["EMA5"] = ema(df["Close"], 5)
+    df["EMA10"] = ema(df["Close"], 10)
+    df["EMA20"] = ema(df["Close"], 20)
+    df["EMA50"] = ema(df["Close"], 50)
+    df["RSI"] = rsi(df["Close"])
+    df["MACD"], _, df["MACD_hist"] = macd(df["Close"])
 
-    return signals
+    bb_u, bb_m, bb_l = bollinger_bands(df["Close"])
+    df["BB_position"] = (df["Close"] - bb_l) / (bb_u - bb_l)
 
+    close_col = df["Close"]
 
-def rule_decision(signals):
-    score = sum(signals.values())
+    if isinstance(close_col, pd.DataFrame):
+        close_col = close_col.iloc[:, 0]
 
-    if score >= 3:
-        return "BUY", score
-    elif score == 2:
-        return "HOLD", score
-    else:
-        return "SELL", score
+    # df["ATR_percent"] = df["ATR"] / close_col
 
+    df["ATR"] = atr(df)
+    df["ATR_pct"] = df["ATR"] / df["Close"]
+
+    df["Volume_MA"] = df["Volume"].rolling(20).mean()
+    df["Volume_ratio"] = df["Volume"] / df["Volume_MA"]
+
+    df["OBV"] = obv(df)
+    df["OBV_EMA"] = ema(df["OBV"], 20)
+
+    df["ret_1"] = df["Close"].pct_change()
+    df["volatility"] = df["ret_1"].rolling(10).std()
+
+    df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+    return df
+
+FEATURES = [
+    "EMA20","EMA50","RSI","MACD","MACD_hist",
+    "BB_position","ATR_pct","Volume_ratio",
+    "OBV_EMA","ret_1","volatility"
+]
 
 # =========================
-# Layer 2: ML Model
+# Model
 # =========================
 
-@st.cache_resource
-def train_ml_model(df):
-    """
-    Trains a direction classifier.
-    Cached so it does NOT retrain on every interaction.
-    """
+def train_model(df, model_type):
+    df = df.dropna()
+    if len(df) < 200:
+        return None, None
 
-    data = df.copy()
+    X = df[FEATURES]
+    y = df["target"]
 
-    # Feature engineering
-    data["return"] = data["Close"].pct_change()
-    data["volatility"] = data["return"].rolling(10).std()
-    data["trend_strength"] = data["EMA20"] - data["EMA50"]
+    split = int(len(df) * 0.8)
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-    # IMPORTANT FIX: ensure 1D arrays
-    data["volume_ratio"] = data["Volume"].values / data["Volume_MA"].values
-
-    # Target: next-day direction
-    data["target"] = (data["Close"].shift(-1) > data["Close"]).astype(int)
-
-    features = [
-        "trend_strength",
-        "RSI",
-        "volume_ratio",
-        "return",
-        "volatility"
-    ]
-
-    data = data.dropna()
-
-    X = data[features]
-    y = data["target"]
+    clf = (
+        GradientBoostingClassifier(random_state=42)
+        if model_type == "gradient_boosting"
+        else RandomForestClassifier(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_leaf=10,
+            random_state=42,
+            n_jobs=-1
+        )
+    )
 
     model = Pipeline([
         ("scaler", StandardScaler()),
-        ("clf", LogisticRegression())
+        ("clf", clf)
     ])
 
-    model.fit(X, y)
+    model.fit(X_train, y_train)
+    prob = model.predict_proba(X_test)[:,1]
 
-    return model, features
+    return model, {
+        "accuracy": accuracy_score(y_test, model.predict(X_test)),
+        "auc": roc_auc_score(y_test, prob)
+    }
 
+# =========================
+# UI
+# =========================
 
+st.title("📈 Enhanced Stock Prediction System")
 
-def ml_probability(model, features, latest_row):
-    X = latest_row[features].values.reshape(1, -1)
-    prob = model.predict_proba(X)[0][1]
-    return prob
-
-def run_screener(tickers, period="1y"):
-    results = []
-
-    for ticker in tickers:
-        df = yf.download(ticker, period=period, progress=False)
-        if df.empty:
-            continue  # skip invalid tickers
-
-        # Flatten columns in case of MultiIndex
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        # Indicators
-        df["EMA20"] = ema(df["Close"], 20)
-        df["EMA50"] = ema(df["Close"], 50)
-        df["RSI"] = rsi(df["Close"], 14)
-        df["Volume_MA"] = df["Volume"].rolling(20).mean()
-
-        # Layer 1 signals
-        signals = layer1_signals(df)
-        rule_result, score = rule_decision(signals)
-
-        # ML
-        model, features = train_ml_model(df)
-        latest = df.copy()
-        latest["return"] = latest["Close"].pct_change()
-        latest["volatility"] = latest["return"].rolling(10).std()
-        latest["trend_strength"] = latest["EMA20"] - latest["EMA50"]
-        latest["volume_ratio"] = latest["Volume"].values / latest["Volume_MA"].values
-        latest = latest.dropna()
-        prob_up = ml_probability(model, features, latest.iloc[-1])
-
-        # Hybrid decision
-        if rule_result == "BUY" and prob_up > 0.6:
-            final_decision = "BUY"
-        elif rule_result == "SELL":
-            final_decision = "SELL"
-        else:
-            final_decision = "HOLD"
-
-        results.append({
-            "Ticker": ticker,
-            "Decision": final_decision,
-            "Rule Score": score,
-            "ML Prob": round(prob_up, 2),
-            "Trend": signals["trend"],
-            "Momentum": signals["momentum"],
-            "Volume": signals["volume"]
-        })
-
-    return pd.DataFrame(results)
+tab1, tab2 = st.tabs(["Single Stock", "Multi Screener"])
 
 
-
-# ===================================================================================================
-# Streamlit UI
-# ===================================================================================================
-
-# ======= Tab 1 ==========
+# ---------- TAB 1 ----------
 with tab1:
-    st.set_page_config("Hybrid Stock Predictor", layout="centered")
-    st.title("📊 Stock Hybrid Screener")
-    st.caption("Scan stock using rules + ML hybrid system")
-    with st.expander("ℹ️ Explanation of Metrics"):
-        st.markdown("""
-        **Final Decision**:  
-        The hybrid recommendation based on **Layer 1 rules** (trend, momentum, volume) + **ML probability**.  
-        - BUY → strong bullish signal  
-        - HOLD → uncertain or moderate signal  
-        - SELL → bearish signal  
+    c1, c2, c3, c4 = st.columns(4)
 
-        **Rule Score**:  
-        Sum of the Layer 1 rule signals:  
-        - Trend (EMA20 > EMA50) = 1 if True else 0  
-        - Momentum (RSI in healthy range 40–70) = 1 if True else 0  
-        - Volume (current volume > 20-day average) = 1 if True else 0  
-        **Total score** ranges from 0–3, higher score → stronger BUY signal  
+    with c1:
+        ticker = st.text_input("Ticker", "AAPL")
 
-        **ML Probability (Up)**:  
-        Probability (0–1) predicted by the ML model that the stock will move up the next day.  
-        - 0.68 means the model estimates a 68% chance of upward movement  
+    with c2:
+        period = st.selectbox("History Period", ["6mo","1y","2y","5y"])
 
-        **Rule Signals**:  
-        Individual signals used in Layer 1 rules:  
-        - trend → 1 if uptrend (EMA20 > EMA50), else 0  
-        - momentum → 1 if RSI healthy (40–70), else 0  
-        - volume → 1 if volume above 20-day MA, else 0  
+    with c3:
+        interval = st.selectbox(
+            "Time Frame",
+            ["1d","1h","30m","15m","5m"]
+        )
 
-        **Position Fraction**:  
-        Portion of your total capital recommended to invest based on ML confidence:  
-        - 0% → very low confidence (do not invest)  
-        - 30% → low confidence  
-        - 50% → medium confidence  
-        - 100% → high confidence  
+    with c4:
+        model_type = st.selectbox(
+            "Model",
+            ["random_forest","gradient_boosting"]
+        )
 
-        **Shares to Buy (Next Open)**:  
-        Number of shares you could buy at the next day’s opening price based on **Position Fraction** and your total capital.  
-        - 0.00 → either the hybrid system suggests SELL/HOLD, or your position fraction is 0 (low confidence)
-        """)
-
-
-    ticker = st.text_input("Stock Ticker", "AAPL")
-    period = st.selectbox("Data Period", ["1y", "2y", "3y"], index=1)
-
-    if st.button("Analyze"):
+    if st.button("Analyze", type="primary"):
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            progress=False
+        )
         
-        df = yf.download(ticker, period=period)
-        # Flatten MultiIndex columns if present
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-
         if df.empty:
-            st.error("Invalid ticker or no data.")
+            st.error("No data")
             st.stop()
 
-        # Indicators
-        df["EMA20"] = ema(df["Close"], 20)
-        df["EMA50"] = ema(df["Close"], 50)
-        df["RSI"] = rsi(df["Close"], 14)
-        df["Volume_MA"] = df["Volume"].rolling(20).mean()
+        df = add_features(df)
+        model, metrics = train_model(df, model_type)
 
-        # ===== Layer 1 =====
-        signals = layer1_signals(df)
-        rule_result, score = rule_decision(signals)
+        if model is None:
+            st.error("Not enough data")
+            st.stop()
 
-        # ===== Layer 2 =====
-        model, features = train_ml_model(df)
+        last_X = df[FEATURES].iloc[[-1]]
+        base_prob = model.predict_proba(last_X)[0][1]
 
-        latest = df.copy()
-        latest["return"] = latest["Close"].pct_change()
-        latest["volatility"] = latest["return"].rolling(10).std()
-        latest["trend_strength"] = latest["EMA20"] - latest["EMA50"]
-        latest["volume_ratio"] = latest["Volume"] / latest["Volume_MA"]
-
-        latest = latest.dropna()
-        prob_up = ml_probability(model, features, latest.iloc[-1])
-
-        # ===== Hybrid Decision =====
-        if rule_result == "BUY" and prob_up > 0.6:
-            final_decision = "BUY"
-        elif rule_result == "SELL":
-            final_decision = "SELL"
-        else:
-            final_decision = "HOLD"
-
-        # ===== Output =====
-        st.subheader("🧠 Hybrid Decision")
-        st.metric("Final Decision", final_decision)
-        st.metric("Rule Score", score)
-        st.metric("ML Probability (Up)", f"{prob_up:.2f}")
-
-        st.write("### Rule Signals")
-        st.write(signals)
-
-        # ===== Confidence-based Position Sizing =====
-        capital = 10000  # total capital, can be user input later
-
-        if prob_up < 0.6:
-            position_fraction = 0
-        elif prob_up < 0.7:
-            position_fraction = 0.3
-        elif prob_up < 0.8:
-            position_fraction = 0.5
-        else:
-            position_fraction = 1.0
-
-        shares_to_buy = (capital * position_fraction) / df["Open"].iloc[-1] if final_decision=="BUY" else 0
-
-        st.metric("Position Fraction", f"{position_fraction*100:.0f}%")
-        st.metric("Shares to Buy (Next Open)", f"{shares_to_buy:.2f}")
-
-        # ===== Add explanation =====
-        with st.expander("ℹ️ Explanation for Position Sizing"):
-            st.markdown("""
-            **Position Fraction**: Portion of your total capital suggested to invest in this stock based on ML confidence.
-            - 0% → Hold / do not buy  
-            - 30% → Small position (low confidence)  
-            - 50% → Medium position (moderate confidence)  
-            - 100% → Full position (high confidence)  
-
-            **Shares to Buy (Next Open)**: Number of shares to purchase at the **next day’s opening price** based on your position fraction and total capital.  
-            - Example: If Position Fraction = 50% and capital = $10,000, the app calculates how many shares you can buy at the next open price.
-            """)
-
-        # ===== Chart =====
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(df["Close"], label="Close")
-        ax.plot(df["EMA20"], label="EMA20")
-        ax.plot(df["EMA50"], label="EMA50")
-        ax.legend()
-        st.pyplot(fig)
-
-        # ===== Candlestick Chart =====
-        st.subheader("📊 Candlestick Chart")
-
-        fig = go.Figure()
-
-        # Candles
-        fig.add_trace(go.Candlestick(
-            x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Price"
-        ))
-
-        # EMA overlays
-        fig.add_trace(go.Scatter(
-            x=df.index,
-            y=df["EMA20"],
-            mode="lines",
-            name="EMA20"
-        ))
-
-        fig.add_trace(go.Scatter(
-            x=df.index,
-            y=df["EMA50"],
-            mode="lines",
-            name="EMA50"
-        ))
-
-        fig.update_layout(
-            xaxis_title="Date",
-            yaxis_title="Price",
-            height=500,
-            xaxis_rangeslider_visible=False,
-            template="plotly_dark"
-        )
-
+        # ---- Candlestick Chart ----
+        fig = go.Figure(data=[
+            go.Candlestick(
+                x=df.index,
+                open=df["Open"],
+                high=df["High"],
+                low=df["Low"],
+                close=df["Close"]
+            )
+        ])
+        fig.update_layout(height=500, xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
+        st.subheader("📊 Model Metrics")
+        st.metric("Accuracy", f"{metrics['accuracy']:.1%}")
+        st.metric("AUC", f"{metrics['auc']:.2f}")
 
-        st.caption("ML does not predict price. It estimates probability given similar past conditions.")
+        # ---- Next 5 Candle Projection ----
+        st.subheader("🔮 Next 5 Candle Direction (Probabilistic)")
 
-    
-    # ======= Tab 2 ==========
-    with tab2:
-        st.title("📊 Stock Hybrid Screener")
-        st.caption("Scan multiple stocks at once using rules + ML")
-        # Add explanation notes
-        with st.expander("ℹ️ Column Explanation"):
-            st.markdown("""
-            **Decision**: Final hybrid recommendation based on rules + ML probability (BUY / HOLD / SELL)  
-            **Rule Score**: Sum of Layer 1 rule signals (Trend + Momentum + Volume). 3 = strong BUY, 2 = HOLD, 1 or 0 = SELL  
-            **ML Prob**: Probability (0–1) predicted by the ML model that the stock will go up next day  
-            **Trend**: 1 if EMA20 > EMA50 (uptrend), 0 otherwise  
-            **Momentum**: 1 if RSI is in healthy range (40–70), 0 otherwise  
-            **Volume**: 1 if current volume > 20-day average, 0 otherwise  
-            """)
+        projections = []
+        for i in range(1, 6):
+            decay = 0.85 ** (i - 1)
+            prob = base_prob * decay + 0.5 * (1 - decay)
+            direction = "UP" if prob >= 0.5 else "DOWN"
 
-        tickers_input = st.text_area(
-            "Enter tickers (comma-separated, e.g., AAPL, MSFT, TSLA)",
-            value="AAPL, MSFT, TSLA",
-            key="multi"
-        )
-        period_multi = st.selectbox("Select data period", ["6mo", "1y", "2y"], index=1, key="multi_period")
+            projections.append({
+                "Candle +": i,
+                "Direction": direction,
+                "Confidence": f"{prob:.1%}"
+            })
 
-        if st.button("Run Screener", key="multi_btn"):
-            tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-            if not tickers:
-                st.warning("Please enter at least one ticker")
-            else:
-                screener_df = run_screener(tickers, period_multi)
-                if screener_df.empty:
-                    st.error("No valid tickers found or data unavailable")
-                else:
-                    # Optional: highlight BUY/SELL
-                    def highlight_decisions(val):
-                        color = ""
-                        if val == "BUY":
-                            color = "background-color: lightgreen"
-                        elif val == "SELL":
-                            color = "background-color: salmon"
-                        return color
+        st.dataframe(pd.DataFrame(projections), use_container_width=True)
 
-                    st.dataframe(
-                        screener_df.style.applymap(highlight_decisions, subset=["Decision"])
-                    )
+# ---------- TAB 2 ----------
+with tab2:
+    tickers = st.text_area(
+        "Tickers (comma separated)",
+        "AAPL,MSFT,GOOGL,AMZN,TSLA"
+    )
+
+    period_multi = st.selectbox("Period", ["6mo","1y","2y"])
+    interval_multi = st.selectbox("Time Frame", ["1d","1h","30m"])
+    model = st.selectbox("Models", ["random_forest","gradient_boosting"])
+
+    if st.button("Run Screener", type="primary"):
+        rows = []
+
+        for t in [x.strip() for x in tickers.split(",") if x.strip()]:
+            df = yf.download(t, period=period_multi, interval=interval_multi, progress=False)
+            if df.empty:
+                continue
+
+            df = add_features(df)
+            model, metrics = train_model(df, model)
+            if model:
+                prob = model.predict_proba(df[FEATURES].iloc[[-1]])[0][1]
+                rows.append({
+                    "Ticker": t,
+                    "Next Candle Prob ↑": f"{prob:.1%}",
+                    "Accuracy": f"{metrics['accuracy']:.1%}",
+                    "AUC": f"{metrics['auc']:.2f}"
+                })
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
-        
+### 🎓 About This System
+st.markdown("""
+**Accuracy Tips:**
+- Use 2+ years of data
+- Random Forest usually best
+- Look for AUC > 0.60
+- Compare to buy-and-hold
+""")
