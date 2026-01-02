@@ -54,6 +54,16 @@ def atr(df, period=14):
 def obv(df):
     return (np.sign(df["Close"].diff()) * df["Volume"]).fillna(0).cumsum()
 
+def next_timestamp(ts, interval, steps=1):
+    if interval.endswith("d"):
+        return ts + pd.Timedelta(days=int(interval[:-1]) * steps)
+    if interval.endswith("h"):
+        return ts + pd.Timedelta(hours=int(interval[:-1]) * steps)
+    if interval.endswith("m"):
+        return ts + pd.Timedelta(minutes=int(interval[:-1]) * steps)
+    return ts
+
+
 # =========================
 # Feature Engineering
 # =========================
@@ -213,21 +223,39 @@ with tab1:
         st.metric("AUC", f"{metrics['auc']:.2f}")
 
         # ---- Next 5 Candle Projection ----
-        st.subheader("🔮 Next 5 Candle Direction (Probabilistic)")
+        st.subheader("🔮 Next 5 Candle Projection")
 
-        projections = []
+        last_close = df["Close"].iloc[-1]
+        last_time = df.index[-1]
+        avg_ret = df["ret_1"].rolling(20).mean().iloc[-1]
+
+        rows = []
+        projected_price = last_close
+
         for i in range(1, 6):
             decay = 0.85 ** (i - 1)
             prob = base_prob * decay + 0.5 * (1 - decay)
             direction = "UP" if prob >= 0.5 else "DOWN"
 
-            projections.append({
-                "Candle +": i,
+            expected_ret = avg_ret * (prob - 0.5) * 2
+            projected_price *= (1 + expected_ret)
+
+            ts = next_timestamp(last_time, interval, i)
+
+            is_intraday = not interval.endswith("d")
+
+            rows.append({
+                "Candle": f"+{i}",
+                "Date": ts.date(),
+                # "Time": ts.time(),
+                "Time": ts.time() if is_intraday else "-",
+                "Projected Close": f"{projected_price:.2f}",
                 "Direction": direction,
                 "Confidence": f"{prob:.1%}"
             })
 
-        st.dataframe(pd.DataFrame(projections), use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
 
 # ---------- TAB 2 ----------
 with tab2:
